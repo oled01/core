@@ -54,23 +54,10 @@ class BundledFile extends File {
 	 * @throws FileLocked
 	 * @return Array $property
 	 */
-	public function createFile($bundleContents, $metadata) {
-		if (!isset($bundleContents) || !isset($metadata)){
-			throw new Forbidden('Function received wrong argument');
+	public function createFile($fileData, $fileAttributes) {
+		if (!is_resource($fileData) || !isset($fileAttributes)){
+			throw new Forbidden('Function BundledFile->createFile received wrong argument');
 		}
-
-		if (!isset($metadata['content-id'])){
-			throw new BadRequest('Request contains part without required headers and multistatus response cannot be constructed');
-		}
-		$fileContentID = $metadata['content-id'];
-
-		//This part should check whether binary content exists for specified content-ids in metadata for that file.
-		if (!isset($bundleContents[$fileContentID])){
-			throw new BadRequest('File object has no associated data binaries, wrong metadata or corrupted file contents');
-		}
-
-		//that assembles the file
-		$fileData = $bundleContents[$fileContentID];
 
 		try {
 			$exists = $this->fileView->file_exists($this->path);

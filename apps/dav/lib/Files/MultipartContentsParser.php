@@ -72,8 +72,10 @@ class MultipartContentsParser {
         if (!is_resource($content)) {
             throw new BadRequest('Unable to get request content');
         }
+        
         $line = fgets($content);
         $this->cursor = ftell($content);
+
 
         return $line;
     }
@@ -112,7 +114,6 @@ class MultipartContentsParser {
             $this->content = $this->request->getBody();
 
             if (!$this->content) {
-                //TODO: handle exception PROPERLY
                 throw new BadRequest('Unable to get request content');
             }
         }
@@ -158,12 +159,16 @@ class MultipartContentsParser {
                 if (!isset($headers['content-length'])){
                     throw new BadRequest('Content-length header in one of the contents is missing, multipart message cannot be parsed');
                 }
-
-                $bodyString = $this->streamRead(intval($headers['content-length']));
+                $bodyLengthHeader = intval($headers['content-length']);
+                $bodyString = $this->streamRead($bodyLengthHeader);
 
                 //TODO: WARNING, this function uses php://temp, which my cause some issues with temp location
                 $bodyStream = fopen('php://temp', 'r+');
-                fwrite($bodyStream, $bodyString);
+                $bodyStreamLength = fwrite($bodyStream, $bodyString);
+
+                if ($bodyStreamLength != $bodyLengthHeader){
+                    $this->resetContent($headers,$bodyStream,$bodyStream);
+                }
 
                 // TODO: Discuss if it has to be option or required field
 			    if (isset($headers['content-md5'])) {
@@ -173,9 +178,7 @@ class MultipartContentsParser {
                     if (!($hash === $contentMD5)) {
                         // Binary contents are not aware of what file they belog to, so ignore content part with wrong md5 sum.
                         // null as file header will trigger an BundledFile class error for the corresponding content-id in metadata
-                        $headers = null;
-                        fclose($bodyStream);
-                        $bodyStream = null;
+                        $this->resetContent($headers,$bodyStream,$bodyStream);
                     }
                 }
 
@@ -200,6 +203,20 @@ class MultipartContentsParser {
         return array($headers, $bodyStream);
     }
 
+    /**
+     * Resets the header and body, as well as associated bodyStream
+     * 
+     * @param  array reference $headers
+     * @param  resource reference $bodyStream
+     * 
+     * @return void
+     */
+    private function resetContent(&$headers,&$bodyStream) {
+        $headers = null;
+        fclose($bodyStream);
+        $bodyStream = null;
+    }
+    
     /**
      * Read the contents from the current file pointer to the specified length
      *

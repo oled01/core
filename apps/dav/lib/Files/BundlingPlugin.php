@@ -65,6 +65,10 @@ class BundlingPlugin extends ServerPlugin {
 	private $boundary = null;
 
 	/**
+	 * @var String
+	 */
+	private $startContent = null;
+	/**
 	 * @var \OCA\DAV\FilesBundle
 	 */
 	private $contentHandler = null;
@@ -128,15 +132,26 @@ class BundlingPlugin extends ServerPlugin {
 		$this->request = $request;
 		$this->response = $response;
 
+		//TODO: add emit (beforeBind)
+
+
 		//validate the request before parsing
 		$this->validateRequest();
 
-		//Create objects ($bundleMetadata,$bundleData) from metadata and binary contents
-		$bundleMetadata = $this->getBundleMetadata();
-		$bundleContents = $this->getBundleContents();
+		//TODO: enshour to sign in proper classes to this emit
+		if (!$this->server->emit('beforeWriteBundle', [$this->userFilesHome])){
+			throw new Forbidden('beforeWriteBundle preconditions failed');
+		}
+		
+		//Create objects ($bundleMetadata,$bundleBinaries) from metadata and binary contents
+		list($bundleMetadata, $bundleBinaries) = $this->getBundleContents();
 
 		//Process bundle and send a multistatus response
-		return $this->processBundle($bundleMetadata,$bundleContents);
+		$result = $this->processBundle($bundleMetadata,$bundleBinaries);
+
+		//TODO: add emit (afterBind)
+		//TODO: add emit (afterCreateFile)
+		return $result;
 	}
 
 	/**
@@ -211,15 +226,9 @@ class BundlingPlugin extends ServerPlugin {
 		}
 
 		$contentParts = explode(';', $this->request->getHeader('Content-Type'));
-		if (count($contentParts) != 2) {
+		if (count($contentParts) != 3) {
 			//TODO:handle exception
 			throw new Forbidden('Improper Content-type format. Boundary may be missing');
-		}
-
-		//TODO: is it working like that??
-		if (!$this->server->emit('beforeWriteBundle', [$this->userFilesHome])){
-			//TODO:handle exception
-			throw new Forbidden('beforeWriteBundle preconditions failed');
 		}
 		
 		//Validate content-type
@@ -246,6 +255,21 @@ class BundlingPlugin extends ServerPlugin {
 		if (substr($boundary, 0, 1) == '"' && substr($boundary, -1) == '"') {
 			$boundary = substr($boundary, 1, -1);
 		}
+
+		//Validate start
+		$startPart = trim($contentParts[2]);
+		$shouldStart = 'start=';
+		if (substr($startPart, 0, strlen($shouldStart)) != $shouldStart) {
+			//TODO:handle exception
+			throw new BadRequest('Boundary is not set');
+		}
+
+		$start = substr($startPart, strlen($shouldStart));
+		if (substr($start, 0, 1) == '"' && substr($start, -1) == '"') {
+			$start = substr($start, 1, -1);
+		}
+
+		$this->startContent = $start;
 		$this->boundary = $boundary;
 	}
 
@@ -257,37 +281,35 @@ class BundlingPlugin extends ServerPlugin {
 	 * @throws /Sabre\DAV\Exception\BadRequest
 	 * @return array
 	 */
-	private function getBundleMetadata() {
-		list($boundaryContentHeader, $boundaryContent) = $this->getPart($this->request, $this->boundary);
-
-		if ($boundaryContentHeader === null && $boundaryContent === null){
+	private function getBundleMetadata($metadataContent, $metadataContentHeader) {
+		if (!isset($metadataContentHeader['content-type'])) {
 			//TODO: handle exception PROPERLY
-			throw new BadRequest('Empty bundle form found');
+			throw new BadRequest('Metadata does not contain content-type header');
 		}
-
 		$expectedContentType = 'application/json';
-		if (array_key_exists('content-type', $boundaryContentHeader) && substr($boundaryContentHeader['content-type'], 0, strlen($expectedContentType)) != $expectedContentType) {
+		if (substr($metadataContentHeader['content-type'], 0, strlen($expectedContentType)) != $expectedContentType) {
 			//TODO: handle exception PROPERLY
 			throw new BadRequest(sprintf(
 				'Expected content type of first part is %s. Found %s',
 				$expectedContentType,
-				$boundaryContentHeader['content-type']
+				$metadataContentHeader['content-type']
 			));
 		}
 		
 		//rewind to the begining of file for streamCopy and copy stream
-		rewind($boundaryContent);
-		$jsonContent = json_decode(stream_get_contents($boundaryContent), true);
+		rewind($metadataContent);
+		$jsonContent = json_decode(stream_get_contents($metadataContent), true);
 		if ($jsonContent === null) {
 			//TODO: handle exception PROPERLY
 			throw new BadRequest('Unable to parse JSON');
 		}
+		fclose($metadataContent);
 
 		return $jsonContent;
 	}
 
 	/**
-	 * Get the content part of the request.
+	 * Get the content parts of the request.
 	 *
 	 * Note: MUST be called after getBundleMetadata, and just one time.
 	 *
@@ -299,7 +321,7 @@ class BundlingPlugin extends ServerPlugin {
 		while(!$this->endDelimiterReached){
 			list($partHeader, $partContent) = $this->getPart($this->request, $this->boundary);
 
-			if (!isset($partHeader['content-id'])){
+			if (!isset($partHeader['content-id']) || is_null($partContent)){
 				// Binary contents are not aware of what file they belog to, so ignore content part without content-id.
 				// Lack of corresponding $bundleBinaries[$binaryID] binary part will trigger an BundledFile class error for the corresponding content-id in metadata
 				continue;
@@ -308,9 +330,15 @@ class BundlingPlugin extends ServerPlugin {
 
 			//perform shallow copying of binary content to an array identified by content-id
 			$bundleBinaries[$binaryID]=$partContent;
+			$contentMetadata[$binaryID]=$partHeader;
 		}
 
-		return $bundleBinaries;
+		if (!isset($contentMetadata[$this->startContent]) || !isset($bundleBinaries[$this->startContent])){
+			throw new BadRequest('Bundle object has no associated metadata');
+		}
+		$bundleMetadata = $this->getBundleMetadata($bundleBinaries[$this->startContent], $contentMetadata[$this->startContent]);
+
+		return array($bundleMetadata, $bundleBinaries);
 	}
 
 	/**
@@ -318,9 +346,10 @@ class BundlingPlugin extends ServerPlugin {
 	 *
 	 * @return boolean
 	 */
-	private function processBundle($bundleMetadata, $bundleContents) {
-		//First loop over folders from metadata to reduce overhead comming from getNodeForPath for files within the same folder
+	private function processBundle($bundleMetadata, $bundleBinaries) {
 		$bundleResponseProperties = array();
+
+		//Loop reads through each fileMetadata included in the Bundle Metadata JSON
 		foreach($bundleMetadata as $filePath => $fileAttributes)
 		{
 			list($folderPath, $fileName) = URLUtil::splitPath($filePath);
@@ -340,7 +369,23 @@ class BundlingPlugin extends ServerPlugin {
 				$this->handleFileMultiStatusError($bundleResponseProperties, $filePath, 400,'Sabre\DAV\Exception\BadRequest','File creation on not existing or without creation permission parent folder is not permitted');
 				continue;
 			}
-			
+
+			//Check if file metadata specifies which binaries belong to the file
+			if (!isset($fileAttributes['content-id'])){
+				$this->handleFileMultiStatusError($bundleResponseProperties, $filePath, 400,'Sabre\DAV\Exception\BadRequest','Request contains part without required headers and multistatus response cannot be constructed');
+				continue;
+			}
+			$fileContentID = $fileAttributes['content-id'];
+
+			//This part should check whether binary content exists for specified content-ids in metadata for that file.
+			if (!isset($bundleBinaries[$fileContentID])){
+				$this->handleFileMultiStatusError($bundleResponseProperties, $filePath, 400,'Sabre\DAV\Exception\BadRequest','File object has no associated data binaries, wrong metadata or corrupted file contents');
+				continue;
+			}
+
+			//that assembles the file
+			$fileData = $bundleBinaries[$fileContentID];
+
 			try {
 				$absoluteFilePath = $this->fileView->getAbsolutePath($folderPath) . '/' . $fileName;
 
@@ -350,7 +395,7 @@ class BundlingPlugin extends ServerPlugin {
 				$node->acquireLock(ILockingProvider::LOCK_SHARED);
 				
 				//file put return properties for bundle response, it is dependent on class BundledFile
-				$property = $node->createFile($bundleContents, $fileAttributes);
+				$properties = $node->createFile($fileData, $fileAttributes);
 			}
 			catch(\Exception $e){
 				$this->handleFileMultiStatusError($bundleResponseProperties, $filePath, 400, 'Sabre\DAV\Exception\BadRequest', $e->getMessage());
@@ -358,7 +403,7 @@ class BundlingPlugin extends ServerPlugin {
 			}
 
 			$this->server->tree->markDirty($filePath);
-			$this->handleFileMultiStatus($bundleResponseProperties, $filePath, 200, $property);
+			$this->handleFileMultiStatus($bundleResponseProperties, $filePath, 200, $properties);
 		}
 		//multistatus response anounced
 		$this->response->setHeader('Content-Type', 'application/xml; charset=utf-8');
