@@ -134,16 +134,29 @@ class MultipartContentsParser {
         $endDelimiter = '--'.$boundary.'--';
         $boundaryCount = 0;
         $content = '';
+        $headers = null;
+        $bodyStream = null;
+        
         while (!$this->eof()) {
             $line = $this->gets();
             if ($line === false) {
-                throw new BadRequest('An error appears while reading input in content part');
+                if ($boundaryCount == 0) {
+                    //empty part, ignore
+                    break;
+                }
+                else{
+                    throw new BadRequest('An error appears while reading and parsing header of content part using fgets');
+                }
             }
 
             if ($boundaryCount == 0) {
                 if ($line != $delimiter) {
                     if ($this->getCursor() == strlen($line)) {
-                        throw new BadRequest('Expected boundary delimiter in content part');
+                        throw new BadRequest('Expected boundary delimiter in content part - not a multipart/related request');
+                    }
+                    elseif ($line == $endDelimiter || $line == $endDelimiter."\r\n") {
+                        $this->endDelimiterReached = true;
+                        break;
                     }
                 } else {
                     continue;
@@ -189,10 +202,10 @@ class MultipartContentsParser {
                 //at this point we expect boundrary
                 continue;
             }
-            elseif ($boundaryCount == 2 && $line == $delimiter) {
+            elseif ($line == $delimiter) {
                 break;
             }
-            elseif ($boundaryCount == 2 && ($line == $endDelimiter || $line == $endDelimiter."\r\n")) {
+            elseif ($line == $endDelimiter || $line == $endDelimiter."\r\n") {
                 $this->endDelimiterReached = true;
                 break;
             }
@@ -200,6 +213,10 @@ class MultipartContentsParser {
             $content .= $line;
         }
 
+        if ($this->eof()){
+            $this->endDelimiterReached = true;
+        }
+        
         return array($headers, $bodyStream);
     }
 
@@ -227,7 +244,7 @@ class MultipartContentsParser {
      */
     public function streamRead($length) {
         if ($length<0) {
-            throw new BadRequest('streamRead cannot read contents with negative length');
+            throw new BadRequest('Method streamRead cannot read contents with negative length');
         }
         $source = $this->getContent();
         $bufChunkSize = 8192;
@@ -254,7 +271,6 @@ class MultipartContentsParser {
     private function readHeaders($content) {
         $headerLimitation = strpos($content, "\r\n\r\n");
         if ($headerLimitation === false) {
-            //TODO: handle exception
             throw new BadRequest('Unable to determine headers limit for content part');
         }
         $headersContent = substr($content, 0, $headerLimitation);
@@ -262,7 +278,6 @@ class MultipartContentsParser {
         foreach (explode("\r\n", $headersContent) as $header) {
             $parts = explode(':', $header);
             if (count($parts) != 2) {
-                //TODO: handle exception
                 throw new BadRequest('Header of content part contains incorrect headers');
             }
             $headers[strtolower(trim($parts[0]))] = trim($parts[1]);
